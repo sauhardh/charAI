@@ -486,7 +486,8 @@ def run_training_stage(
             leave=False,
             file=sys.stdout,
         )
-        for batch in pbar:
+        log_every = max(1, len(train_loader) // 5)  # log ~5 times per epoch
+        for batch_idx, batch in enumerate(pbar):
             waveforms = batch["waveform"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
 
@@ -513,6 +514,15 @@ def run_training_stage(
                 "loss": f"{loss.item():.4f}",
                 "acc": f"{(train_top1 / total_samples)*100:.1f}%",
             })
+
+            # Log to file every log_every batches (tqdm only shows in terminal/widget)
+            if (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == len(train_loader):
+                logging.info(
+                    f"  [S{stage_num} Ep {epoch:02d}/{epochs:02d}] "
+                    f"Batch {batch_idx+1}/{len(train_loader)} | "
+                    f"Loss: {loss.item():.4f} | "
+                    f"RunAcc: {(train_top1 / total_samples)*100:.1f}%"
+                )
 
         train_loss /= max(total_samples, 1)
         train_top1 /= max(total_samples, 1)
