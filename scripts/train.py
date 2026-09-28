@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import ASTForAudioClassification
@@ -79,7 +79,7 @@ class Config:
     num_classes: int = 10      # Dynamically updated from dataset
 
     # 2-Stage Training Schedule
-    stage1_lr: float = 5e-4
+    stage1_lr: float = 1e-4
     stage1_freeze_layers: int = 8
     stage1_epochs: int = 25
 
@@ -98,6 +98,18 @@ class Config:
 
     def __post_init__(self):
         self.clip_samples = int(self.clip_duration * self.sample_rate)
+
+
+
+@torch.jit.script
+def _iir_baseline(mel_power: torch.Tensor, s: float) -> torch.Tensor:
+    """Causal IIR smoothing compiled via TorchScript — eliminates Python loop overhead."""
+    M = torch.empty_like(mel_power)
+    M[:, :, 0] = s * mel_power[:, :, 0]
+    T = mel_power.shape[2]
+    for t in range(1, T):
+        M[:, :, t] = (1.0 - s) * M[:, :, t - 1] + s * mel_power[:, :, t]
+    return M
 
 
 # ==============================================================================
@@ -147,11 +159,7 @@ class TorchMelPCEN(nn.Module):
         return torch.matmul(self.mel_fb, power_spec)
 
     def compute_baseline(self, mel_power: torch.Tensor) -> torch.Tensor:
-        M = torch.empty_like(mel_power)
-        M[:, :, 0] = self.s * mel_power[:, :, 0]
-        for t in range(1, mel_power.shape[-1]):
-            M[:, :, t] = (1.0 - self.s) * M[:, :, t - 1] + self.s * mel_power[:, :, t]
-        return M
+        return _iir_baseline(mel_power, self.s)
 
     def compute_pcen(self, mel_power: torch.Tensor, baseline: torch.Tensor) -> torch.Tensor:
         agc_denom = (self.eps + baseline).pow(self.alpha)
@@ -183,19 +191,19 @@ class TorchSpecAugment(nn.Module):
 
     def forward(self, spec: torch.Tensor) -> torch.Tensor:
         spec = spec.clone()
-        _, _, n_mels, n_frames = spec.shape
+        B, _, n_mels, n_frames = spec.shape
 
-        # Mask frequency bands
-        for _ in range(self.nF):
-            f = random.randint(0, self.F)
-            f0 = random.randint(0, max(0, n_mels - f))
-            spec[:, :, f0 : f0 + f, :] = 0.0
+        # Apply independent masks per sample (not per batch) for better augmentation diversity
+        for b in range(B):
+            for _ in range(self.nF):
+                f = random.randint(0, self.F)
+                f0 = random.randint(0, max(0, n_mels - f))
+                spec[b, :, f0 : f0 + f, :] = 0.0
 
-        # Mask time slices
-        for _ in range(self.nT):
-            t = random.randint(0, self.T)
-            t0 = random.randint(0, max(0, n_frames - t))
-            spec[:, :, :, t0 : t0 + t] = 0.0
+            for _ in range(self.nT):
+                t = random.randint(0, self.T)
+                t0 = random.randint(0, max(0, n_frames - t))
+                spec[b, :, :, t0 : t0 + t] = 0.0
 
         return spec
 
@@ -258,7 +266,12 @@ class BirdAudioDataset(Dataset):
         if len(audio) < self.config.clip_samples:
             audio = np.pad(audio, (0, self.config.clip_samples - len(audio)))
         elif len(audio) > self.config.clip_samples:
-            audio = audio[: self.config.clip_samples]
+            # Random crop during training for temporal augmentation; fixed crop for val/test
+            if self.split == "train":
+                start = random.randint(0, len(audio) - self.config.clip_samples)
+                audio = audio[start : start + self.config.clip_samples]
+            else:
+                audio = audio[: self.config.clip_samples]
         return audio
 
     def __len__(self) -> int:
@@ -328,9 +341,6 @@ class ASTBirdClassifier(nn.Module):
             ignore_mismatched_sizes=True,
         )
 
-        # Gradient checkpointing for reduced VRAM usage on HPC GPUs
-        self.ast.gradient_checkpointing_enable()
-
         # Regularization dropout before classification head
         if dropout > 0.0:
             orig_dense = self.ast.classifier.dense
@@ -358,6 +368,11 @@ class ASTBirdClassifier(nn.Module):
                     param.requires_grad = False
                     frozen_count += 1
         logging.info(f"Froze {frozen_count}/{total_count} parameter tensors (layers 0 to {n_layers-1} + embeddings)")
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing — only safe on single GPU (incompatible with DataParallel)."""
+        self.ast.gradient_checkpointing_enable()
+        logging.info("Gradient checkpointing enabled.")
 
     def unfreeze_all_layers(self):
         """Unfreezes all parameters for full end-to-end fine-tuning."""
@@ -388,7 +403,7 @@ class ASTBirdClassifier(nn.Module):
 
 class ClassBalancedBCELoss(nn.Module):
     """Class-balanced BCE loss to handle species imbalance."""
-    def __init__(self, class_counts: Optional[np.ndarray] = None, beta: float = 0.999):
+    def __init__(self, class_counts: Optional[np.ndarray] = None, beta: float = 0.999, label_smoothing: float = 0.1):
         super().__init__()
         pos_weight = None
         if class_counts is not None and len(class_counts) > 0:
@@ -400,11 +415,16 @@ class ClassBalancedBCELoss(nn.Module):
             pos_weight = torch.tensor(weights, dtype=torch.float32)
 
         self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        self.label_smoothing = label_smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         if targets.ndim == 1:
             targets = F.one_hot(targets, num_classes=logits.shape[-1]).float()
-        return self.loss_fn(logits, targets)
+        if self.label_smoothing > 0:
+            num_classes = logits.shape[-1]
+            targets = targets * (1.0 - self.label_smoothing) + self.label_smoothing / num_classes
+        # Cast logits to fp32 to prevent NaN from fp16 overflow with large pos_weight
+        return self.loss_fn(logits.float(), targets)
 
 
 def compute_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Tuple[float, float]:
@@ -444,7 +464,10 @@ def run_training_stage(
         lr=lr,
         weight_decay=1e-2 if stage_num == 2 else 1e-3,
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    warmup_epochs = max(1, min(5, epochs // 5))
+    _warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    _cosine = CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[_warmup, _cosine], milestones=[warmup_epochs])
     use_cuda = "cuda" in str(device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
 
@@ -506,7 +529,8 @@ def run_training_stage(
                 with torch.amp.autocast("cuda", enabled=use_cuda):
                     specs = mel_pcen(waveforms)
                     logits = model(specs)
-                    loss = criterion(logits, labels)
+                # Compute loss in fp32 outside autocast to prevent NaN with large pos_weight
+                loss = criterion(logits.float(), labels)
 
                 b_top1, b_top5 = compute_metrics(logits, labels)
                 bs = len(labels)
@@ -532,7 +556,8 @@ def run_training_stage(
         if val_top1 > best_val_top1:
             best_val_top1 = val_top1
             patience_counter = 0
-            torch.save(model.state_dict(), best_checkpoint_path)
+            _state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+            torch.save(_state, best_checkpoint_path)
             logging.info(f"  >>> Best Stage {stage_num} model saved to {best_checkpoint_path} (Val Top-1: {val_top1*100:.2f}%)")
         else:
             patience_counter += 1
@@ -543,7 +568,11 @@ def run_training_stage(
     # Reload best weights for subsequent stage
     if best_checkpoint_path.exists():
         logging.info(f"Reloading best checkpoint from {best_checkpoint_path}")
-        model.load_state_dict(torch.load(best_checkpoint_path, map_location=device))
+        _ckpt = torch.load(best_checkpoint_path, map_location=device)
+        if hasattr(model, "module"):
+            model.module.load_state_dict(_ckpt)
+        else:
+            model.load_state_dict(_ckpt)
 
     return best_val_top1
 
@@ -827,6 +856,13 @@ def main():
         freeze_layers=cfg.stage1_freeze_layers,
         config=cfg,
     ).to(cfg.device)
+    # Gradient checkpointing is incompatible with DataParallel — enable only for single GPU
+    if torch.cuda.device_count() <= 1:
+        model.enable_gradient_checkpointing()
+        logging.info("Gradient checkpointing enabled (single-GPU mode).")
+    if torch.cuda.device_count() > 1:
+        logging.info(f"Using {torch.cuda.device_count()} GPUs via DataParallel (gradient checkpointing disabled).")
+        model = torch.nn.DataParallel(model)
 
     # 2. Stage 1: Warmup Training
     run_training_stage(
@@ -846,7 +882,10 @@ def main():
 
     # 3. Stage 2: Full Fine-Tuning
     logging.info("Transitioning to Stage 2: Unfreezing all backbone layers...")
-    model.unfreeze_all_layers()
+    if hasattr(model, "module"):
+        model.module.unfreeze_all_layers()
+    else:
+        model.unfreeze_all_layers()
 
     run_training_stage(
         stage_num=2,
