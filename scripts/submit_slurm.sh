@@ -25,7 +25,7 @@ mkdir -p outputs/models
 echo "Starting job on $(hostname) with GPU: $CUDA_VISIBLE_DEVICES"
 nvidia-smi
 
-python3 hpc/train.py \
+python3 scripts/train.py \
     --clips_csv outputs/data/final/csv/clips_metadata.csv \
     --output_dir outputs/models \
     --batch_size 16 \

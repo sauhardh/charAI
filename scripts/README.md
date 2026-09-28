@@ -21,7 +21,7 @@ From the project root:
 
 ```bash
 # Launch training in a detached tmux session named "ast_train"
-./hpc/run_tmux.sh
+./scripts/run_tmux.sh
 ```
 
 ### Essential tmux Commands
@@ -52,7 +52,7 @@ From the project root:
 You can run `train.py` directly with custom hyperparameters:
 
 ```bash
-python3 hpc/train.py \
+python3 scripts/train.py \
   --batch_size 32 \
   --num_workers 6 \
   --stage1_epochs 30 \
@@ -76,7 +76,7 @@ python3 hpc/train.py \
 If your HPC cluster uses Slurm:
 
 ```bash
-sbatch hpc/submit_slurm.sh
+sbatch scripts/submit_slurm.sh
 ```
 
 Check job status:
